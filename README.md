@@ -64,6 +64,7 @@ OPTIONS
   --max_unchanged_words N     -  Maximum unchanged words when extracting edits. Default = 2.
   --ignore_whitespace_casing  -  Ignore edits that only affect whitespace and casing. Default no.
   --beta                      -  Set the ratio of recall importance against precision. Default = 0.5.
+  --timeout                   -  Max number of seconds per sample
 
 ```
 #### 2.1 System output format

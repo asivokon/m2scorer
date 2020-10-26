@@ -22,6 +22,7 @@ from optparse import OptionParser
 
 from util import uniq
 import re
+import signal
 import sys
 from copy import deepcopy
 
@@ -35,6 +36,12 @@ def batch_recall(candidates, sources, gold_edits, max_unchanged_words=2, beta=0.
 
 def batch_f1(candidates, sources, gold_edits, max_unchanged_words=2, beta=0.5, ignore_whitespace_casing=False, verbose=False):
     return batch_pre_rec_f1(candidates, sources, gold_edits, max_unchanged_words, beta, ignore_whitespace_casing, verbose)[2]
+
+class TimeoutError(Exception):
+    pass
+
+def handler(signum, frame):
+    raise TimeoutError
 
 def comp_p(a, b):
     try:
@@ -102,100 +109,27 @@ def f1_suffstats(candidate, source, gold_edits, max_unchanged_words=2, ignore_wh
         print("-------------------------------------------")
     return (stat_correct, stat_proposed, stat_gold)
 
-def batch_multi_pre_rec_f1(candidates, sources, gold_edits, max_unchanged_words=2, beta=0.5, ignore_whitespace_casing= False, verbose=False, very_verbose=False):
+def batch_multi_pre_rec_f1(candidates, sources, gold_edits, max_unchanged_words=2, beta=0.5, ignore_whitespace_casing= False, verbose=False, very_verbose=False, timeout=None):
     assert len(candidates) == len(sources) == len(gold_edits)
+    signal.signal(signal.SIGALRM, handler)
     stat_correct = 0.0
     stat_proposed = 0.0
     stat_gold = 0.0
     i = 0
     for candidate, source, golds_set in zip(candidates, sources, gold_edits):
         i = i + 1
-        # Candidate system edit extraction
-        candidate_tok = candidate.split()
-        source_tok = source.split()
-        #lmatrix, backpointers = levenshtein_matrix(source_tok, candidate_tok)
-        lmatrix1, backpointers1 = levenshtein_matrix(source_tok, candidate_tok, 1, 1, 1)
-        lmatrix2, backpointers2 = levenshtein_matrix(source_tok, candidate_tok, 1, 1, 2)
-
-        #V, E, dist, edits = edit_graph(lmatrix, backpointers)
-        V1, E1, dist1, edits1 = edit_graph(lmatrix1, backpointers1)
-        V2, E2, dist2, edits2 = edit_graph(lmatrix2, backpointers2)
-
-        V, E, dist, edits = merge_graph(V1, V2, E1, E2, dist1, dist2, edits1, edits2)
-        if very_verbose:
-            print("edit matrix 1:", lmatrix1)
-            print("edit matrix 2:", lmatrix2)
-            print("backpointers 1:", backpointers1)
-            print("backpointers 2:", backpointers2)
-            print("edits (w/o transitive arcs):", edits)
-        V, E, dist, edits = transitive_arcs(V, E, dist, edits, max_unchanged_words, very_verbose)
-
-        # Find measures maximizing current cumulative F1; local: curent annotator only
-        sqbeta = beta * beta
-        chosen_ann = -1
-        f1_max = -1.0
-
-        argmax_correct = 0.0
-        argmax_proposed = 0.0
-        argmax_gold = 0.0
-        max_stat_correct = -1.0
-        min_stat_proposed = float("inf")
-        min_stat_gold = float("inf")
-        for annotator, gold in golds_set.items():
-            localdist = set_weights(E, dist, edits, gold, verbose, very_verbose)
-            editSeq = best_edit_seq_bf(V, E, localdist, edits, very_verbose)
+        if timeout is not None:
+            signal.alarm(timeout)
+        try:
+            correct, proposed, gold = batch_multi_pre_rec_f1_row(candidate, source, golds_set, max_unchanged_words, beta,
+                                                                 ignore_whitespace_casing, verbose, very_verbose, i,
+                                                                 stat_correct, stat_proposed, stat_gold)
+            stat_correct += correct
+            stat_proposed += proposed
+            stat_gold += gold
+        except TimeoutError:
             if verbose:
-                print(">> Annotator:", annotator)
-            if very_verbose:
-                print("Graph(V,E) = ")
-                print("V =", V)
-                print("E =", E)
-                print("edits (with transitive arcs):", edits)
-                print("dist() =", localdist)
-                print("viterbi path =", editSeq)
-            if ignore_whitespace_casing:
-                editSeq = [x for x in editSeq if not equals_ignore_whitespace_casing(x[2], x[3])]
-            correct = matchSeq(editSeq, gold, ignore_whitespace_casing, verbose)
-
-            # local cumulative counts, P, R and F1
-            stat_correct_local = stat_correct + len(correct)
-            stat_proposed_local = stat_proposed + len(editSeq)
-            stat_gold_local = stat_gold + len(gold)
-            p_local = comp_p(stat_correct_local, stat_proposed_local)
-            r_local = comp_r(stat_correct_local, stat_gold_local)
-            f1_local = comp_f1(stat_correct_local, stat_proposed_local, stat_gold_local, beta)
-
-            if f1_max < f1_local or \
-              (f1_max == f1_local and max_stat_correct < stat_correct_local) or \
-              (f1_max == f1_local and max_stat_correct == stat_correct_local and min_stat_proposed + sqbeta * min_stat_gold > stat_proposed_local + sqbeta * stat_gold_local):
-                chosen_ann = annotator
-                f1_max = f1_local
-                max_stat_correct = stat_correct_local
-                min_stat_proposed = stat_proposed_local
-                min_stat_gold = stat_gold_local
-                argmax_correct = len(correct)
-                argmax_proposed = len(editSeq)
-                argmax_gold = len(gold)
-
-            if verbose:
-                print("SOURCE        :", source.encode("utf8"))
-                print("HYPOTHESIS    :", candidate.encode("utf8"))
-                print("EDIT SEQ      :", [shrinkEdit(ed) for ed in list(reversed(editSeq))])
-                print("GOLD EDITS    :", gold)
-                print("CORRECT EDITS :", correct)
-                print("# correct     :", int(stat_correct_local))
-                print("# proposed    :", int(stat_proposed_local))
-                print("# gold        :", int(stat_gold_local))
-                print("precision     :", p_local)
-                print("recall        :", r_local)
-                print("f_%.1f         :" % beta, f1_local)
-                print("-------------------------------------------")
-        if verbose:
-            print(">> Chosen Annotator for line", i, ":", chosen_ann)
-            print("")
-        stat_correct += argmax_correct
-        stat_proposed += argmax_proposed
-        stat_gold += argmax_gold
+                print("Line #", i, "skipped.")
 
     try:
         p  = stat_correct / stat_proposed
@@ -219,6 +153,95 @@ def batch_multi_pre_rec_f1(candidates, sources, gold_edits, max_unchanged_words=
         print("F_%.1f =" % beta, f1)
     return (p, r, f1)
 
+
+def batch_multi_pre_rec_f1_row(candidate, source, golds_set, max_unchanged_words, beta, ignore_whitespace_casing,
+                               verbose, very_verbose, idx, stat_correct, stat_proposed, stat_gold):
+    # Candidate system edit extraction
+    candidate_tok = candidate.split()
+    source_tok = source.split()
+    # lmatrix, backpointers = levenshtein_matrix(source_tok, candidate_tok)
+    lmatrix1, backpointers1 = levenshtein_matrix(source_tok, candidate_tok, 1, 1, 1)
+    lmatrix2, backpointers2 = levenshtein_matrix(source_tok, candidate_tok, 1, 1, 2)
+
+    # V, E, dist, edits = edit_graph(lmatrix, backpointers)
+    V1, E1, dist1, edits1 = edit_graph(lmatrix1, backpointers1)
+    V2, E2, dist2, edits2 = edit_graph(lmatrix2, backpointers2)
+
+    V, E, dist, edits = merge_graph(V1, V2, E1, E2, dist1, dist2, edits1, edits2)
+    if very_verbose:
+        print("edit matrix 1:", lmatrix1)
+        print("edit matrix 2:", lmatrix2)
+        print("backpointers 1:", backpointers1)
+        print("backpointers 2:", backpointers2)
+        print("edits (w/o transitive arcs):", edits)
+    V, E, dist, edits = transitive_arcs(V, E, dist, edits, max_unchanged_words, very_verbose)
+
+    # Find measures maximizing current cumulative F1; local: curent annotator only
+    sqbeta = beta * beta
+    chosen_ann = -1
+    f1_max = -1.0
+
+    argmax_correct = 0.0
+    argmax_proposed = 0.0
+    argmax_gold = 0.0
+    max_stat_correct = -1.0
+    min_stat_proposed = float("inf")
+    min_stat_gold = float("inf")
+    for annotator, gold in golds_set.items():
+        localdist = set_weights(E, dist, edits, gold, verbose, very_verbose)
+        editSeq = best_edit_seq_bf(V, E, localdist, edits, very_verbose)
+        if verbose:
+            print(">> Annotator:", annotator)
+        if very_verbose:
+            print("Graph(V,E) = ")
+            print("V =", V)
+            print("E =", E)
+            print("edits (with transitive arcs):", edits)
+            print("dist() =", localdist)
+            print("viterbi path =", editSeq)
+        if ignore_whitespace_casing:
+            editSeq = [x for x in editSeq if not equals_ignore_whitespace_casing(x[2], x[3])]
+        correct = matchSeq(editSeq, gold, ignore_whitespace_casing, verbose)
+
+        # local cumulative counts, P, R and F1
+        stat_correct_local = stat_correct + len(correct)
+        stat_proposed_local = stat_proposed + len(editSeq)
+        stat_gold_local = stat_gold + len(gold)
+        p_local = comp_p(stat_correct_local, stat_proposed_local)
+        r_local = comp_r(stat_correct_local, stat_gold_local)
+        f1_local = comp_f1(stat_correct_local, stat_proposed_local, stat_gold_local, beta)
+
+        if f1_max < f1_local or \
+                (f1_max == f1_local and max_stat_correct < stat_correct_local) or \
+                (
+                        f1_max == f1_local and max_stat_correct == stat_correct_local and min_stat_proposed + sqbeta * min_stat_gold > stat_proposed_local + sqbeta * stat_gold_local):
+            chosen_ann = annotator
+            f1_max = f1_local
+            max_stat_correct = stat_correct_local
+            min_stat_proposed = stat_proposed_local
+            min_stat_gold = stat_gold_local
+            argmax_correct = len(correct)
+            argmax_proposed = len(editSeq)
+            argmax_gold = len(gold)
+
+        if verbose:
+            print("SOURCE        :", source.encode("utf8"))
+            print("HYPOTHESIS    :", candidate.encode("utf8"))
+            print("EDIT SEQ      :", [shrinkEdit(ed) for ed in list(reversed(editSeq))])
+            print("GOLD EDITS    :", gold)
+            print("CORRECT EDITS :", correct)
+            print("# correct     :", int(stat_correct_local))
+            print("# proposed    :", int(stat_proposed_local))
+            print("# gold        :", int(stat_gold_local))
+            print("precision     :", p_local)
+            print("recall        :", r_local)
+            print("f_%.1f         :" % beta, f1_local)
+            print("-------------------------------------------")
+    if verbose:
+        print(">> Chosen Annotator for line", idx, ":", chosen_ann)
+        print("")
+
+    return (argmax_correct, argmax_proposed, argmax_gold)
 
 def batch_pre_rec_f1(candidates, sources, gold_edits, max_unchanged_words=2, beta=0.5, ignore_whitespace_casing= False, verbose=False, very_verbose=False):
     assert len(candidates) == len(sources) == len(gold_edits)
